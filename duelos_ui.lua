@@ -2,7 +2,9 @@
 	duelos · interfaz "liquid glass" para Delta Executor
 	──────────────────────────────────────────────────────────
 	Replica del prototipo HTML (perfiles.html) usando solo primitivas de
-	GUI de Roblox (CanvasGroup, UIGradient, UICorner, UIStroke, TweenService).
+	GUI de Roblox (Frame, UICorner, UIStroke, UIScale, TweenService).
+	Sin CanvasGroup ni UIGradient: algunos executors no los renderizan bien
+	(ocultaban los hijos / dejaban rectángulos blancos sólidos).
 
 	ESTE ARCHIVO SOLO CONTIENE LA INTERFAZ:
 	- la lógica real (aim / hitbox / cámara / ESP) NO está implementada.
@@ -109,7 +111,9 @@ local function mk(class, props, parent)
 	local o = Instance.new(class)
 	if props then
 		for k, v in pairs(props) do
-			o[k] = v
+			-- si el executor no soporta alguna propiedad, se ignora en vez de
+			-- abortar la construcción de toda la interfaz
+			pcall(function() o[k] = v end)
 		end
 	end
 	if parent then
@@ -314,7 +318,8 @@ local function setSwitch(key, on, instant)
 			}, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
 		end
 	end
-	refreshHomeLabels()
+	-- refreshHomeLabels aún puede ser nil mientras se construye la UI
+	if refreshHomeLabels then refreshHomeLabels() end
 	fireHook(key)
 end
 
@@ -362,7 +367,8 @@ local function makeSwitch(parent, key, x, y, on, z)
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1
 			and input.UserInputType ~= Enum.UserInputType.Touch then return end
 		local target = input.Target
-		if not target or not target:IsDescendantOf(root) then return end
+		local overSwitch = (target == root) or (target and target:IsDescendantOf(root))
+		if not overSwitch then return end
 		knobDrag = {
 			key = key,
 			root = root,
@@ -550,7 +556,7 @@ local function makeSlider(parent, key, x, y, opts, sep)
 		num.Text = shown
 		fill.Size = UDim2.fromOffset(TRACK_W * pct, 3)
 		thumbHolder.Position = UDim2.fromOffset(TRACK_X + TRACK_W * pct - 9, ROW_H / 2 - 9)
-		refreshHomeLabels()
+		if refreshHomeLabels then refreshHomeLabels() end
 		fireHook(key)
 		if opts.onChange then opts.onChange(v) end
 	end
@@ -861,14 +867,14 @@ end
 -- ═══════════════════════════════════════════════════════════════════
 -- ventana
 -- ═══════════════════════════════════════════════════════════════════
-local win = mk("CanvasGroup", {
+local win = mk("Frame", {
 	Name                  = "Window",
 	BackgroundColor3      = C.panel,
-	BackgroundTransparency = 0.28,
+	BackgroundTransparency = 0.15,
 	Size                  = UDim2.fromOffset(WIN_W, NAV_H + 400),
 	Position              = UDim2.fromOffset(40, 60),
 	BorderSizePixel       = 0,
-	GroupTransparency     = 0,
+	Active                = true,
 })
 win.Parent = screen
 round(win, WIN_R)
@@ -878,24 +884,18 @@ win.ClipsDescendants = true
 local winScale = mk("UIScale", {Scale = 1})
 winScale.Parent = win
 
--- brillo superior del vidrio (muy sutil)
+-- brillo superior del vidrio SIN UIGradient:
+-- una sola línea de 1px casi transparente (antes era un rectángulo blanco
+-- que, si el executor no aplicaba el gradiente, tapaba media ventana)
 local sheen = mk("Frame", {
-	BackgroundColor3 = C.white,
-	Position         = UDim2.fromOffset(0, 0),
-	Size             = UDim2.fromOffset(WIN_W, 100),
-	BorderSizePixel  = 0,
-	ZIndex           = 1,
+	BackgroundColor3       = C.white,
+	BackgroundTransparency = 0.94,
+	Position               = UDim2.fromOffset(0, 0),
+	Size                   = UDim2.new(1, 0, 0, 1),
+	BorderSizePixel        = 0,
+	ZIndex                 = 1,
 })
 sheen.Parent = win
-round(sheen, WIN_R)
-local sheenGrad = mk("UIGradient", {
-	Color = ColorSequence.new({
-		ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1, 0.05)),
-		ColorSequenceKeypoint.new(1, Color3.new(1, 1, 1, 0)),
-	}),
-	Rotation = 90,
-})
-sheenGrad.Parent = sheen
 
 -- ── barra de navegación ──
 local nav = mk("Frame", {
@@ -962,10 +962,12 @@ local stage = mk("ScrollingFrame", {
 stage.Parent = win
 
 -- ── agarre de redimensión (esquina inferior derecha) ──
-local grip = mk("Frame", {
+local grip = mk("TextButton", {
 	BackgroundTransparency = 1,
 	Position               = UDim2.new(1, -26, 1, -26),
 	Size                   = UDim2.fromOffset(26, 26),
+	Text                   = "",
+	AutoButtonColor        = false,
 	ZIndex                 = 20,
 })
 grip.Parent = win
@@ -993,7 +995,8 @@ do
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1
 			and input.UserInputType ~= Enum.UserInputType.Touch then return end
 		local t = input.Target
-		if not t or not t:IsDescendantOf(grip) then return end
+		if not t then return end
+		if t ~= grip and not t:IsDescendantOf(grip) then return end
 		resizing = true
 		startX = input.Position.X
 		startZoom = ZOOM
@@ -1029,11 +1032,10 @@ local currentPage = nil
 local currentPageId = "home"
 
 local function newPage(id)
-	local p = mk("CanvasGroup", {
+	local p = mk("Frame", {
 		BackgroundTransparency = 1,
 		Position               = UDim2.fromOffset(0, 0),
 		Size                   = UDim2.fromOffset(WIN_W, 100),
-		GroupTransparency      = 1,
 		BorderSizePixel        = 0,
 		Visible                = false,
 		ZIndex                 = 3,
@@ -1068,14 +1070,6 @@ do
 	round(av, 26)
 	outline(av, C.white, 0.80, 1)
 	av.Parent = me
-	local avGrad = mk("UIGradient", {
-		Color = ColorSequence.new({
-			ColorSequenceKeypoint.new(0, Color3.fromRGB(87, 87, 94)),
-			ColorSequenceKeypoint.new(1, Color3.fromRGB(51, 51, 56)),
-		}),
-		Rotation = 90,
-	})
-	avGrad.Parent = av
 
 	local avInitials = text(av, 0, 0, 52, 52, "AL", 16, C.white, 0.08, FONT_MED,
 		Enum.TextXAlignment.Center, Enum.TextYAlignment.Center, 5)
@@ -1256,7 +1250,7 @@ local function setHeight(id, animate)
 	local vs = cam and cam.ViewportSize or Vector2.new(1920, 1080)
 
 	-- la ventana nunca pasa de la pantalla: si el contenido no cabe, se desplaza
-	local maxH = math.max(220, vs.Y - 80)
+	local maxH = math.max(200, (vs.Y - 80) / math.max(SCALE, 0.1))
 	local h = math.min(NAV_H + contentH, maxH)
 
 	stage.CanvasSize = UDim2.fromOffset(WIN_W, contentH)
@@ -1279,16 +1273,13 @@ showPage = function(id, back)
 	if cur == next then return end
 
 	if cur then
-		cur.GroupTransparency = 1
 		cur.Visible = false
 	end
 
-	next.GroupTransparency = 1
-	next.Position = UDim2.fromOffset(back and -12 or 16, 0)
+	next.Position = UDim2.fromOffset(back and -14 or 16, 0)
 	next.Visible = true
 
 	tween(next, 0.3, {
-		GroupTransparency = 0,
 		Position = UDim2.fromOffset(0, 0),
 	}, Enum.EasingStyle.Quint)
 
@@ -1318,9 +1309,13 @@ do
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
 		local target = input.Target
 		if not target then return end
-		-- sólo la barra de navegación (y no los botones)
-		if not target:IsDescendantOf(nav) then return end
-		if target:IsA("GuiButton") then return end
+		-- se puede arrastrar desde cualquier zona "vacía" de la ventana:
+		-- barra de navegación, títulos, fondos de página... pero no desde
+		-- controles (botones, sliders, switches, selects) ni desde el agarre.
+		if target ~= win and not target:IsDescendantOf(win) then return end
+		if target == grip or target:IsDescendantOf(grip) then return end
+		if target:IsA("GuiButton") or target:IsA("TextBox") then return end
+		if target:IsA("ScrollingFrame") then return end
 
 		startPos = win.Position
 		startMouse = Vector2.new(input.Position.X, input.Position.Y)
@@ -1381,28 +1376,40 @@ if ICON_EYE ~= "" then
 	})
 	ic.Parent = fab
 else
+	-- ojo: forma rellena en rombo redondeado + pupila oscura + brillo
 	local eye = mk("Frame", {
-		BackgroundTransparency = 1,
-		Position               = UDim2.fromOffset(9, 9),
-		Size                   = UDim2.fromOffset(22, 22),
+		BackgroundColor3       = C.white,
+		BackgroundTransparency = 0.04,
+		Position               = UDim2.fromOffset(10, 10),
+		Size                   = UDim2.fromOffset(20, 20),
 		Rotation               = 45,
+		BorderSizePixel        = 0,
 		ZIndex                 = 31,
 	})
 	round(eye, 7)
-	outline(eye, C.white, 0.12, 1.7)
 	eye.Parent = fab
 
 	local pupil = mk("Frame", {
-		BackgroundColor3      = C.white,
-		BackgroundTransparency = 0.15,
-		Size                  = UDim2.fromOffset(9, 9),
-		Position              = UDim2.new(0.5, 0, 0.5, 0),
-		AnchorPoint           = Vector2.new(0.5, 0.5),
-		BorderSizePixel       = 0,
-		ZIndex                = 32,
+		BackgroundColor3 = C.panel,
+		Size             = UDim2.fromOffset(8.5, 8.5),
+		Position         = UDim2.new(0.5, 0, 0.5, 0),
+		AnchorPoint      = Vector2.new(0.5, 0.5),
+		BorderSizePixel  = 0,
+		ZIndex           = 32,
 	})
-	round(pupil, 4.5)
+	round(pupil, 4.25)
 	pupil.Parent = eye
+
+	local glint = mk("Frame", {
+		BackgroundColor3 = C.white,
+		Size             = UDim2.fromOffset(2.4, 2.4),
+		Position         = UDim2.new(0.5, -1.5, 0.5, -1.5),
+		AnchorPoint      = Vector2.new(0.5, 0.5),
+		BorderSizePixel  = 0,
+		ZIndex           = 33,
+	})
+	round(glint, 1.2)
+	glint.Parent = eye
 end
 
 local function fabSave(x, y)
@@ -1451,22 +1458,32 @@ ZOOM = prefs.zoom or 1
 -- abrir / cerrar la interfaz
 -- ═══════════════════════════════════════════════════════════════════
 local uiOpen = true
+local winTween = nil
+
+-- una sola animación de escala a la vez (abrir/cerrar no se pisan)
+local function animWin(target, time, style, dir)
+	if winTween then winTween:Cancel() end
+	winTween = tween(winScale, time, {Scale = target}, style, dir)
+	return winTween
+end
 
 local function openUI()
 	uiOpen = true
 	fab.Visible = false
 	win.Visible = true
-	win.GroupTransparency = 1
 	setHeight(currentPageId or "home", false)
-	tween(win, 0.26, {GroupTransparency = 0}, Enum.EasingStyle.Quint)
+	-- aparece con un pequeño "pop" de escala (sin CanvasGroup)
+	winScale.Scale = SCALE * 0.96
+	animWin(SCALE, 0.24, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
 end
 
 local function closeUI()
 	uiOpen = false
-	tween(win, 0.24, {GroupTransparency = 1}, Enum.EasingStyle.Quint)
-	task.delay(0.26, function()
+	animWin(SCALE * 0.94, 0.18, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+	task.delay(0.2, function()
 		if not uiOpen then
 			win.Visible = false
+			winScale.Scale = SCALE
 			fab.Visible = true
 		end
 	end)
@@ -1500,7 +1517,7 @@ end)
 		UserInputService.InputBegan:Connect(function(input)
 			local target = input.Target
 			if not target then return end
-			if not target:IsDescendantOf(fab) then return end
+			if target ~= fab and not target:IsDescendantOf(fab) then return end
 			down = true
 			moved = false
 			local px, py = pointerPos(input)
@@ -1583,9 +1600,12 @@ end)
 applyScale = function()
 	local cam = workspace.CurrentCamera
 	local vs = cam and cam.ViewportSize or Vector2.new(1920, 1080)
-	local s = clamp(vs.X / 1920, 0.85, 1.15) * ZOOM
-	winScale.Scale = s
-	SCALE = s
+	-- se adapta al ancho Y al alto de la pantalla (antes sólo al ancho, y en
+	-- móvil el panel acababa ocupando media pantalla)
+	local base = math.min(vs.X / 1920, vs.Y / 1080)
+	base = clamp(base, 0.60, 1.15)
+	SCALE = base * ZOOM
+	winScale.Scale = SCALE
 	-- recalcular el alto máximo según la pantalla
 	if currentPageId then setHeight(currentPageId, false) end
 end
@@ -1616,9 +1636,9 @@ do
 	local vs = cam and cam.ViewportSize or Vector2.new(1920, 1080)
 
 	-- posición inicial de la ventana (centrada)
-	local h = NAV_H + (heights.home or 400)
 	local s = winScale.Scale
 	setHeight("home", false)
+	local h = win.Size.Y.Offset
 	win.Position = UDim2.fromOffset(
 		math.max(8, (vs.X - WIN_W * s) / 2),
 		math.max(8, (vs.Y - h * s) / 2)
@@ -1638,7 +1658,6 @@ do
 	-- primera página
 	currentPage = home
 	home.Visible = true
-	home.GroupTransparency = 0
 	home.Position = UDim2.fromOffset(0, 0)
 	title.Text = "duelos"
 	backBtn.Visible = false
@@ -1661,6 +1680,14 @@ local API = {
 	toast  = toast,
 	setSwitch = setSwitch,
 	refreshHomeLabels = refreshHomeLabels,
+
+	-- abrir / cerrar desde tu código (teclas, botones, etc.)
+	open  = openUI,
+	close = closeUI,
+	toggle = function()
+		if uiOpen then closeUI() else openUI() end
+	end,
+	isOpen = function() return uiOpen end,
 
 	-- zoom del panel (0.5 = pequeño, 1.4 = grande)
 	setZoom = function(z)
