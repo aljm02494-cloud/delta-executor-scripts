@@ -274,6 +274,7 @@ end
 -- ═══════════════════════════════════════════════════════════════════
 local Switches = {}   -- key -> lista de piezas
 local ValueLabels = {} -- id -> TextLabel (etiquetas del inicio)
+local clickGuard = {}  -- key -> os.clock() hasta el que se ignora el clic (tras arrastrar)
 
 -- declarations adelantadas (se definen más abajo)
 local refreshHomeLabels
@@ -323,6 +324,40 @@ local function setSwitch(key, on, instant)
 	fireHook(key)
 end
 
+-- ── perilla del switch: mover y soltar ───────────────────────────
+-- (se usan tanto desde los eventos del propio switch como desde los
+--  globales, porque algunos executors no entregan input.Target)
+local function knobMove(px)
+	if not knobDrag or not px then return end
+	local s = (SCALE ~= 0) and SCALE or 1
+	local d = (px - knobDrag.startX) / s
+	if math.abs(d) > 2 then knobDrag.moved = true end
+	if not knobDrag.moved then return end
+
+	local newX = clamp(knobDrag.startPos + d, 0, 18)
+	knobDrag.holder.Position = UDim2.fromOffset(newX, 0)
+	local on = newX > 9
+	if on ~= (knobDrag.root.BackgroundColor3 == C.green) then
+		tween(knobDrag.root, 0.14, {
+			BackgroundColor3       = on and C.green or C.white,
+			BackgroundTransparency = on and 0 or 0.87,
+		})
+	end
+end
+
+local function knobRelease()
+	if not knobDrag then return end
+	local d = knobDrag
+	knobDrag = nil
+	if d.knob then
+		tween(d.knob, 0.22, {Size = UDim2.fromOffset(22, 22)}, Enum.EasingStyle.Back)
+	end
+	if d.moved then
+		clickGuard[d.key] = os.clock() + 0.4
+		setSwitch(d.key, d.holder.Position.X.Offset > 9)
+	end
+end
+
 local function makeSwitch(parent, key, x, y, on, z)
 	local root = button(parent, x, y, 44, 26, z or 5)
 	root.BackgroundColor3 = on and C.green or C.white
@@ -352,23 +387,33 @@ local function makeSwitch(parent, key, x, y, on, z)
 	round(shadow, 10)
 	shadow.Parent = holder
 
-	local knob = mk("Frame", {
+	local knob = mk("TextButton", {
 		BackgroundColor3 = C.white,
 		Size             = UDim2.fromOffset(22, 22),
 		Position         = UDim2.fromOffset(2, 2),
+		Text             = "",
+		AutoButtonColor  = false,
 		BorderSizePixel  = 0,
 		ZIndex           = (z or 5) + 2,
 	})
 	round(knob, 11)
 	knob.Parent = holder
 
-	-- la perilla se puede arrastrar (igual que los deslizadores)
-	UserInputService.InputBegan:Connect(function(input)
+	-- ── activar: clic/tap (el evento más fiable en cualquier executor) ──
+	local function toggleSwitch()
+		local g = clickGuard[key]
+		if g and os.clock() < g then return end
+		setSwitch(key, not Config[key])
+	end
+
+	root.MouseButton1Click:Connect(toggleSwitch)
+	-- la perilla también es un botón: si el toque cae justo encima, responde
+	knob.MouseButton1Click:Connect(toggleSwitch)
+
+	-- ── arrastrar la perilla, como un deslizador ──
+	local function beginKnob(input)
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1
 			and input.UserInputType ~= Enum.UserInputType.Touch then return end
-		local target = input.Target
-		local overSwitch = (target == root) or (target and target:IsDescendantOf(root))
-		if not overSwitch then return end
 		knobDrag = {
 			key = key,
 			root = root,
@@ -380,49 +425,42 @@ local function makeSwitch(parent, key, x, y, on, z)
 		}
 		-- la perilla se ensancha al presionarla
 		tween(knob, 0.24, {Size = UDim2.fromOffset(24, 22)}, Enum.EasingStyle.Back)
-	end)
+	end
+
+	root.InputBegan:Connect(beginKnob)
+	knob.InputBegan:Connect(beginKnob)
+
+	-- mientras el dedo siga sobre el switch, lo seguimos aquí
+	local function followFinger(input)
+		if knobDrag and knobDrag.root == root then
+			knobMove(input.Position.X)
+		end
+	end
+	root.InputChanged:Connect(followFinger)
+	knob.InputChanged:Connect(followFinger)
+
+	root.InputEnded:Connect(knobRelease)
+	knob.InputEnded:Connect(knobRelease)
+	root.MouseButton1Up:Connect(knobRelease)
+	knob.MouseButton1Up:Connect(knobRelease)
 
 	switchParts(key, root, holder, nil)
 	return root
 end
 
--- arrastre de la perilla: al soltar, el estado depende de en qué lado quedó
+-- respaldo global: si al arrastrar la perilla el dedo sale del switch
 UserInputService.InputChanged:Connect(function(input)
 	if not knobDrag then return end
-	local px
 	if input.UserInputType == Enum.UserInputType.MouseMovement
 		or input.UserInputType == Enum.UserInputType.Touch then
-		px = input.Position.X
-	end
-	if not px then return end
-
-	local d = (px - knobDrag.startX) / SCALE
-	if math.abs(d) > 3 then knobDrag.moved = true end
-	if not knobDrag.moved then return end
-
-	local newX = clamp(knobDrag.startPos + d, 0, 18)
-	knobDrag.holder.Position = UDim2.fromOffset(newX, 0)
-	-- el color sigue a la perilla
-	local on = newX > 9
-	if on ~= (knobDrag.root.BackgroundColor3 == C.green) then
-		tween(knobDrag.root, 0.16, {
-			BackgroundColor3      = on and C.green or C.white,
-			BackgroundTransparency = on and 0 or 0.87,
-		})
+		knobMove(input.Position.X)
 	end
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-	if not knobDrag then return end
-	local d = knobDrag
-	knobDrag = nil
-	if d.knob then
-		tween(d.knob, 0.24, {Size = UDim2.fromOffset(22, 22)}, Enum.EasingStyle.Back)
-	end
-	if d.moved then
-		setSwitch(d.key, d.holder.Position.X.Offset > 9)
-	else
-		setSwitch(d.key, not Config[d.key])
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		knobRelease()
 	end
 end)
 
@@ -897,12 +935,28 @@ local sheen = mk("Frame", {
 })
 sheen.Parent = win
 
+-- superficie de arrastre: botón invisible que cubre toda la ventana.
+-- Así se puede mover el panel desde cualquier zona vacía (barra, márgenes,
+-- fondos de las páginas) sin robar clics a botones ni al scroll, porque
+-- va por debajo del contenido.
+local dragSurface = mk("TextButton", {
+	BackgroundTransparency = 1,
+	Position               = UDim2.fromOffset(0, 0),
+	Size                   = UDim2.new(1, 0, 1, 0),
+	Text                   = "",
+	AutoButtonColor        = false,
+	BorderSizePixel        = 0,
+	ZIndex                 = 2,
+})
+dragSurface.Parent = win
+
 -- ── barra de navegación ──
 local nav = mk("Frame", {
 	BackgroundTransparency = 1,
 	Position               = UDim2.fromOffset(0, 0),
 	Size                   = UDim2.fromOffset(WIN_W, NAV_H),
 	ZIndex                 = 5,
+	Active                 = true,
 })
 nav.Parent = win
 
@@ -991,14 +1045,19 @@ do
 	local resizing = false
 	local startX, startZoom = 0, 1
 
-	UserInputService.InputBegan:Connect(function(input)
+	-- eventos del propio agarre (no dependen de input.Target)
+	grip.InputBegan:Connect(function(input)
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1
 			and input.UserInputType ~= Enum.UserInputType.Touch then return end
-		local t = input.Target
-		if not t then return end
-		if t ~= grip and not t:IsDescendantOf(grip) then return end
 		resizing = true
 		startX = input.Position.X
+		startZoom = ZOOM
+	end)
+
+	grip.MouseButton1Down:Connect(function(x)
+		if resizing then return end
+		resizing = true
+		startX = x
 		startZoom = ZOOM
 	end)
 
@@ -1015,6 +1074,20 @@ do
 	end)
 
 	UserInputService.InputEnded:Connect(function(input)
+		if resizing then
+			resizing = false
+			prefs.zoom = ZOOM
+			savePrefs()
+		end
+	end)
+	grip.InputEnded:Connect(function()
+		if resizing then
+			resizing = false
+			prefs.zoom = ZOOM
+			savePrefs()
+		end
+	end)
+	grip.MouseButton1Up:Connect(function()
 		if resizing then
 			resizing = false
 			prefs.zoom = ZOOM
@@ -1299,45 +1372,75 @@ showPage = function(id, back)
 end
 
 -- ═══════════════════════════════════════════════════════════════════
--- arrastre de la ventana (por la barra de navegación)
+-- arrastre de la ventana (desde cualquier zona vacía)
 -- ═══════════════════════════════════════════════════════════════════
 do
 	local dragging = false
-	local startPos, startMouse = nil, nil
+	local startPos, startMouse, startClock = nil, nil, 0
 
-	UserInputService.InputBegan:Connect(function(input)
-		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-		local target = input.Target
-		if not target then return end
-		-- se puede arrastrar desde cualquier zona "vacía" de la ventana:
-		-- barra de navegación, títulos, fondos de página... pero no desde
-		-- controles (botones, sliders, switches, selects) ni desde el agarre.
-		if target ~= win and not target:IsDescendantOf(win) then return end
-		if target == grip or target:IsDescendantOf(grip) then return end
-		if target:IsA("GuiButton") or target:IsA("TextBox") then return end
-		if target:IsA("ScrollingFrame") then return end
-
+	-- se arranca con eventos del PROPIO objeto (no dependen de input.Target,
+	-- que algunos executors entregan como nil)
+	local function beginDrag(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1
+			and input.UserInputType ~= Enum.UserInputType.Touch then return end
+		if dragging then return end
 		startPos = win.Position
 		startMouse = Vector2.new(input.Position.X, input.Position.Y)
+		startClock = os.clock()
 		dragging = true
+	end
+
+	dragSurface.InputBegan:Connect(beginDrag)
+	nav.InputBegan:Connect(beginDrag)
+
+	local function endDrag()
+		dragging = false
+	end
+	dragSurface.InputEnded:Connect(endDrag)
+	nav.InputEnded:Connect(endDrag)
+
+	-- mueve la ventana aplicando el delta desde el punto de agarre
+	local function applyDrag(px, py)
+		local cam = workspace.CurrentCamera
+		local vs = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+		local s = (SCALE ~= 0) and SCALE or 1
+		local dx = (px - startMouse.X) / s
+		local dy = (py - startMouse.Y) / s
+
+		-- los límites se convierten a unidades GUI (vs.X está en píxeles)
+		local maxX = vs.X / s - 70
+		local maxY = vs.Y / s - 50
+		local minX = -(WIN_W - 70)
+
+		win.Position = UDim2.fromOffset(
+			clamp(startPos.X.Offset + dx, minX, maxX),
+			clamp(startPos.Y.Offset + dy, 0, maxY)
+		)
+	end
+
+	-- respaldo: si el executor no entrega el InputChanged global, seguimos
+	-- el puntero con el evento del propio objeto
+	dragSurface.InputChanged:Connect(function(input)
+		if not dragging then return end
+		applyDrag(input.Position.X, input.Position.Y)
 	end)
 
 	UserInputService.InputChanged:Connect(function(input)
 		if not dragging then return end
-		if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
-		local cam = workspace.CurrentCamera
-		local vs = cam and cam.ViewportSize or Vector2.new(1920, 1080)
-		local s = winScale.Scale
-		local dx = (input.Position.X - startMouse.X) / s
-		local dy = (input.Position.Y - startMouse.Y) / s
-		win.Position = UDim2.fromOffset(
-			clamp(startPos.X.Offset + dx, 4, vs.X - 60 * s),
-			clamp(startPos.Y.Offset + dy, 4, vs.Y - 40 * s)
-		)
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement
+			and input.UserInputType ~= Enum.UserInputType.Touch then return end
+		-- seguro: si el executor nunca entrega el InputEnded, no dejamos
+		-- el panel pegado al cursor para siempre
+		if os.clock() - startClock > 12 then
+			dragging = false
+			return
+		end
+		applyDrag(input.Position.X, input.Position.Y)
 	end)
 
 	UserInputService.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = false
 		end
 	end)
@@ -1504,35 +1607,42 @@ end)
 		local down, moved = false, false
 		local sx, sy = 0, 0
 		local dx, dy = 0, 0
+		local fabClock = 0
+		local suppressClickUntil = 0
 
-		local function pointerPos(input)
-			if input.UserInputType == Enum.UserInputType.MouseMovement
-				or input.UserInputType == Enum.UserInputType.MouseButton1
-				or input.UserInputType == Enum.UserInputType.Touch then
-				return input.Position.X, input.Position.Y
-			end
-			return nil, nil
-		end
-
-		UserInputService.InputBegan:Connect(function(input)
-			local target = input.Target
-			if not target then return end
-			if target ~= fab and not target:IsDescendantOf(fab) then return end
+		-- se arranca con eventos del propio botón: no dependen de input.Target
+		local function beginDrag(px, py)
 			down = true
 			moved = false
-			local px, py = pointerPos(input)
-			if px then
-				sx, sy = px, py
-				dx = px - fab.AbsolutePosition.X
-				dy = py - fab.AbsolutePosition.Y
-			end
+			fabClock = os.clock()
+			sx, sy = px, py
+			dx = px - fab.AbsolutePosition.X
+			dy = py - fab.AbsolutePosition.Y
+		end
+
+		fab.InputBegan:Connect(function(input)
+			if input.UserInputType ~= Enum.UserInputType.MouseButton1
+				and input.UserInputType ~= Enum.UserInputType.Touch then return end
+			if down then return end
+			beginDrag(input.Position.X, input.Position.Y)
+		end)
+
+		fab.MouseButton1Down:Connect(function(x, y)
+			if down then return end
+			beginDrag(x, y)
 		end)
 
 		UserInputService.InputChanged:Connect(function(input)
 			if not down then return end
-			local px, py = pointerPos(input)
-			if not px then return end
-			if not moved and (math.abs(px - sx) > 6 or math.abs(py - sy) > 6) then
+			if input.UserInputType ~= Enum.UserInputType.MouseMovement
+				and input.UserInputType ~= Enum.UserInputType.Touch then return end
+			-- seguro contra executors que no entregan el InputEnded
+			if os.clock() - fabClock > 12 then
+				down = false
+				return
+			end
+			local px, py = input.Position.X, input.Position.Y
+			if not moved and (math.abs(px - sx) > 8 or math.abs(py - sy) > 8) then
 				moved = true
 				fab.BackgroundColor3 = Color3.fromRGB(40, 40, 44)
 			end
@@ -1545,24 +1655,35 @@ end)
 			)
 		end)
 
-		UserInputService.InputEnded:Connect(function(input)
+		local function finishDrag()
 			if not down then return end
 			down = false
 			fab.BackgroundColor3 = C.panel
-
-			-- un toque abre la interfaz; si se arrastró, sólo se guarda la posición
-			if not moved then
-				if not uiOpen then openUI() end
-				return
+			if moved then
+				-- evita que el clic de después vuelva a abrir/cerrar
+				suppressClickUntil = os.clock() + 0.45
+				local cam = workspace.CurrentCamera
+				local vs = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+				fabSave(
+					clamp(fab.Position.X.Offset, 6, vs.X - 46),
+					clamp(fab.Position.Y.Offset, 6, vs.Y - 46)
+				)
 			end
-			local x = clamp(fab.Position.X.Offset, 6, 1e6)
-			local y = clamp(fab.Position.Y.Offset, 6, 1e6)
-			fabSave(x, y)
-		end)
+		end
 
-		-- fallback: si el clic no llegó al manejador de arrastre
+		UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				finishDrag()
+			end
+		end)
+		fab.InputEnded:Connect(finishDrag)
+		fab.MouseButton1Up:Connect(finishDrag)
+
+		-- abrir con un toque (MouseButton1Click funciona en todo executor)
 		fab.MouseButton1Click:Connect(function()
-			if not uiOpen and not moved then openUI() end
+			if os.clock() < suppressClickUntil then return end
+			if not uiOpen then openUI() end
 		end)
 	end
 
@@ -1586,12 +1707,21 @@ UserInputService.InputEnded:Connect(function(input)
 	end
 end)
 
+-- cerrar el desplegable al tocar fuera de él (por posición, sin depender
+-- de input.Target, que en algunos executors llega nil)
 UserInputService.InputBegan:Connect(function(input)
-	if popup and input.Target then
-		if not input.Target:IsDescendantOf(popup) then
-			closePopup()
-		end
+	if not popup then return end
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1
+		and input.UserInputType ~= Enum.UserInputType.Touch then return end
+	local p = input.Position
+	local ap = popup.AbsolutePosition
+	local asz = popup.AbsoluteSize
+	if p and ap and asz then
+		local inside = p.X >= ap.X and p.X <= ap.X + asz.X
+			and p.Y >= ap.Y and p.Y <= ap.Y + asz.Y
+		if inside then return end
 	end
+	closePopup()
 end)
 
 -- ═══════════════════════════════════════════════════════════════════
