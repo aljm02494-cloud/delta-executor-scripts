@@ -1835,7 +1835,8 @@ do
 end
 
 -- ═══════════════════════════════════════════════════════════════════
--- API pública (para conectar tu lógica)
+-- API pública
+-- (para conectar tu lógica)
 -- ═══════════════════════════════════════════════════════════════════
 local API = {
 	Config = Config,
@@ -1871,7 +1872,14 @@ local API = {
 }
 
 if type(getgenv) == "function" then
-	getgenv().Duelos = API
+	-- FUSIONA en la tabla compartida en vez de reemplazarla: si el
+	-- núcleo ya se cargó antes, sus campos (_core, _esp…) se conservan.
+	local g = getgenv()
+	local shared = type(g.Duelos) == "table" and g.Duelos or {}
+	for k, v in pairs(API) do
+		shared[k] = v
+	end
+	g.Duelos = shared
 end
 
 return API
@@ -1883,11 +1891,13 @@ local Core = (function()
 	duelos · core
 	──────────────────────────────────────────────────────────
 	Estado compartido entre los módulos (cámara / hitbox / ESP /
-	contador). Se publica en getgenv().DuelosCore para que los
-	módulos cargados por separado (paste, loadstring, require)
-	compartan la MISMA instancia y la misma tabla Config.
+	contador) + utilidades de robustez.
 
-	Orden de carga obligatorio:
+	Publica un ÚNICO objeto global (getgenv().Duelos) para no dejar
+	basura en el entorno del executor. La interfaz (duelos_ui.lua) se
+	 fusiona en esa misma tabla, así que da igual el orden de carga.
+
+	Orden de carga recomendado:
 		core.lua → mod_camera.lua → mod_hitbox.lua → mod_esp.lua → mod_playercount.lua
 ]]
 
@@ -1901,6 +1911,23 @@ Core.Players          = Players
 Core.Workspace        = Workspace
 Core.UserInputService = UserInputService
 Core.LocalPlayer      = Players.LocalPlayer
+
+-- ═══════════════════════════════════════════════════════════════════
+-- espacio de nombres único
+-- ═══════════════════════════════════════════════════════════════════
+-- Devuelve la tabla compartida getgenv().Duelos, creándola si hace
+-- falta. Todos los módulos publican ahí dentro, así que el executor
+-- queda con un solo global en vez de seis.
+function Core.api()
+	local g = (type(getgenv) == "function") and getgenv() or nil
+	if not g then return {} end
+	local t = g.Duelos
+	if type(t) ~= "table" then
+		t = {}
+		g.Duelos = t
+	end
+	return t
+end
 
 -- ═══════════════════════════════════════════════════════════════════
 -- CONFIG · valor por defecto (si la interfaz no está cargada)
@@ -1935,12 +1962,44 @@ Core.DefaultConfig = {
 
 -- config viva de la interfaz (misma tabla que getgenv().Duelos.Config)
 function Core.getConfig()
-	local g = (type(getgenv) == "function") and getgenv() or nil
-	local api = g and g.Duelos
-	if api and type(api.Config) == "table" then
+	local api = Core.api()
+	if type(api.Config) == "table" then
 		return api.Config
 	end
 	return Core.DefaultConfig
+end
+
+-- ═══════════════════════════════════════════════════════════════════
+-- robustez
+-- ═══════════════════════════════════════════════════════════════════
+-- Errores silenciados: un error por frame llenaría la consola del
+-- executor (y algunos anti-cheats leen el log). Aquí se cuentan y
+-- se descartan.
+Core.errors = 0
+
+function Core.silent(fn, ...)
+	if type(fn) ~= "function" then return nil end
+	local ok, a, b = pcall(fn, ...)
+	if not ok then
+		Core.errors += 1
+		return nil
+	end
+	return a, b
+end
+
+-- Ejecuta fn como máximo una vez cada `interval` segundos.
+-- Se usa para el ESP: no necesita ir a 60 Hz y así el motor no
+-- instancia/destruye objetos en cada frame.
+local _last = {}
+function Core.throttle(key, interval, fn)
+	local now = os.clock()
+	local last = _last[key]
+	if last and (now - last) < interval then
+		return false
+	end
+	_last[key] = now
+	fn()
+	return true
 end
 
 -- ═══════════════════════════════════════════════════════════════════
@@ -2076,7 +2135,7 @@ end
 function Core.normalizeAlpha(value)
 	local v = tonumber(value)
 	if v == nil then return 0.8 end
-	if v > 1 then v = v / 100 end           -- 80 -> 0.8
+	if v > 1 then v = v / 100 end
 	return math.clamp(v, 0, 1)
 end
 
@@ -2106,6 +2165,11 @@ end
 
 -- suavizado independiente del framerate:
 -- speed = 65  ->  alpha = 1 - (1 - 0.65)^(dt*60)
+--
+-- NOTA: un alpha alto hace que la cámara "salte" de golpe al objetivo.
+-- El servidor ve la rotación del personaje, así que un salto grande
+-- en un solo frame es la señal más obvia de un aimbot. Bajar 'speed'
+-- / 'camSmooth' (o subir el número de pasos) suaviza ese salto.
 function Core.smoothAlpha(percent, dt)
 	local p = Core.clamp((tonumber(percent) or 50) / 100, 0.01, 1)
 	local frames = math.max(dt, 1 / 240) * 60
@@ -2113,13 +2177,324 @@ function Core.smoothAlpha(percent, dt)
 end
 
 -- ═══════════════════════════════════════════════════════════════════
--- publicación global
+-- limpieza (al cerrar o recargar el script)
 -- ═══════════════════════════════════════════════════════════════════
-if type(getgenv) == "function" then
-	getgenv().DuelosCore = Core
+-- Registro de funciones de limpieza. Se ejecutan en orden inverso
+-- al llamar a Core.runCleanups(), para no dejar objetos huérfanos
+-- (Highlights en el mundo, hitboxes deformadas, FOV alterado).
+local cleanups = {}
+
+function Core.onCleanup(fn)
+	if type(fn) == "function" then
+		cleanups[#cleanups + 1] = fn
+	end
+end
+
+function Core.runCleanups()
+	for i = #cleanups, 1, -1 do
+		pcall(cleanups[i])
+		cleanups[i] = nil
+	end
+end
+
+-- ═══════════════════════════════════════════════════════════════════
+-- publicación
+-- ═══════════════════════════════════════════════════════════════════
+-- TODO cuelga de la tabla compartida Duelos (no de un global propio)
+do
+	local api = Core.api()
+	api._core = Core
+	-- la interfaz puede haberse cargado antes o después: se preserva
+	-- su Config sin pisarla con la de por defecto
+	if type(api.Config) ~= "table" then
+		api.Config = Core.DefaultConfig
+	end
 end
 
 return Core
+end)()
+
+local Hardening = (function()
+-- ═════════ HARDENING (mod_hardening.lua) ═════════
+--[[
+	duelos · hardening
+	──────────────────────────────────────────────────────────
+	Capa de robustez que envuelve a los módulos para dejar el menor
+	rastro posible en el cliente.
+
+	QUÉ HACE Y POR QUÉ
+	──────────────────
+	1) ERRORES SILENCIADOS
+	   Un `error()` dentro de un bucle de render llena la consola del
+	   executor con decenas de líneas por segundo. Eso no lo ve el
+	   servidor, pero delata el script ante cualquier captura de
+	   pantalla o diagnóstico. Aquí los errores se cuentan y se
+	   descartan.
+
+	2) UN SOLO GLOBAL
+	   Cada módulo publicaba su propio global (DuelosCore, DuelosESP,
+	   DuelosCamera...). Seis globals con nombres propios del script son
+	   una firma fácil de detectar. Ahora todo vive bajo `Duelos`.
+
+	3) LIMPIEZA AL CERRAR
+	   Al recargar el script, la instancia anterior debe soltarlo todo:
+	   restore de hitboxes, destrucción de ESP, FOV original. Sin esto
+	   se quedan Highlights en el mundo y tamaños deformados.
+
+	4) ESCRITURAS ESPACIAS
+	   Escribir Size o CFrame en cada frame satura la cola de
+	   replicación. Los módulos sólo escriben cuando el valor cambia.
+
+	5) SIN PAUTAS EN EL RENDER LOOP
+	   El ESP y el contador corren a baja frecuencia (12 Hz y 1 Hz).
+	   El render loop sólo hace trabajo cuando hay algo que cambiar.
+
+	Requiere core.lua cargado antes.
+]]
+
+local Mod = {}
+Mod.__name = "Hardening"
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 1) errores silenciados
+-- ═══════════════════════════════════════════════════════════════════
+-- Contador de errores. Si sube mucho, el módulo está fallando;
+-- se puede consultar con getgenv().Duelos._errors.
+Core.errors = 0
+
+-- Ejecuta fn sin propagar el error. Devuelve nil si falló.
+function Mod.guard(fn, ...)
+	if type(fn) ~= "function" then return nil end
+	local ok, a, b = pcall(fn, ...)
+	if not ok then
+		Core.errors += 1
+		return nil
+	end
+	return a, b
+end
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 2) escrituras sólo cuando cambian
+-- ═══════════════════════════════════════════════════════════════════
+-- Escribe una propiedad sólo si su valor es distinto al anterior.
+-- Evita el tráfico de replicación continuo.
+function Mod.setProp(obj, prop, value)
+	if not obj then return false end
+	local cur = obj[prop]
+	if cur == value then return false end
+	local ok = pcall(function()
+		obj[prop] = value
+	end)
+	return ok
+end
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 3) limpieza al cerrar / recargar
+-- ═══════════════════════════════════════════════════════════════════
+-- El registro de limpiezas vive en Core (Core.onCleanup /
+-- Core.runCleanups), para que cualquier módulo pueda enganchar la
+-- suya y todas se ejecuten juntas al cerrar.
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 4) instalación
+-- ═══════════════════════════════════════════════════════════════════
+-- Se llama desde duelos_main / el archivo único. Registra la limpieza
+-- global y deja el estado limpio.
+function Mod.install(api)
+	api = api or Core.api()
+
+	-- una sola tabla global
+	api._hardening = Mod
+	api._errors = 0
+
+	-- al apagar 'cam' o al cerrar, el FOV vuelve al original
+	Core.onCleanup(function()
+		local cam = Core.getCamera()
+		if cam and Core.originalFov then
+			pcall(function()
+				cam.FieldOfView = Core.originalFov
+			end)
+			Core.originalFov = nil
+		end
+	end)
+
+	return Mod
+end
+
+-- ═══════════════════════════════════════════════════════════════════
+-- publicación (tabla compartida Duelos)
+-- ═══════════════════════════════════════════════════════════════════
+Core.api()._hardening = Mod
+
+return Mod
+end)()
+
+local Trace = (function()
+-- ═════════ RASTRO (mod_trace.lua) ═════════
+--[[
+	duelos · rastro (control de señales visibles)
+	──────────────────────────────────────────────────────────
+	Ajusta el COMPORTAMIENTO del script para reducir las señales que
+	el servidor (y cualquier anti-cheat del juego) puede observar.
+
+	QUÉ OBSERVA EL SERVIDOR Y CÓMO SE AFECTA
+	──────────────────────────────────────────
+	· La ORIENTACIÓN del personaje. El servidor ve el
+	  HumanoidRootPart girando. Si el aim rota el cuerpo de golpe
+	  (180° en un frame), es físicamente imposible con un ratón y es
+	  la señal más obvia de un aimbot.
+
+	    → 'speed' / 'camSmooth' bajos = giros graduales.
+	    → Mod.MAX_TURN limita cuántos grados puede girar por frame.
+
+	· LA VELOCIDAD DE ESCRITURA. Cada cambio de CFrame o de Size
+	  genera tráfico replicado. Escribir 60 veces por segundo satura
+	  la cola.
+
+	    → Mod.MAX_TURN + suavizado = muchas menos escrituras.
+	    → El ESP va a 12 Hz, no a 60.
+	    → El Size del hitbox sólo se escribe cuando cambia la escala.
+
+	· LOS OBJETOS EN EL MUNDO. Un Highlight dentro del modelo de otro
+	  jugador es una señal trivial (no hay ningún Highlight legítimo
+	  ahí). Este script los cuelga de un contenedor propio.
+
+	· EL FOV DE LA CÁMARA. Se guarda el original y se restaura.
+
+	NO PUEDE OCULTARSE
+	──────────────────
+	Un aimbot SIEMPRE deja rastro: el servidor ve a dónde apunta el
+	jugador y a quién mata. Este módulo reduce el ruido, no lo
+	elimina. La detección por patrones de puntería (la más común)
+	depende del servidor comparando la mira del jugador con el
+	objetivo: por eso el suavizado gradual importa más que cualquier
+	truco de ofuscación.
+
+	Requiere core.lua cargado antes.
+]]
+
+local Mod = {}
+Mod.__name = "Trace"
+
+-- ═══════════════════════════════════════════════════════════════════
+-- LÍMITES
+-- ═══════════════════════════════════════════════════════════════════
+-- Grados máximos de giro por frame. 12°/frame a 60 Hz ≈ 720°/s:
+-- rápido pero físicamente posible con un ratón. Subirlo hace el
+-- aim más instantáneo y más detectable.
+Mod.MAX_TURN = 12
+
+-- Frames sin escribir la cámara cuando el objetivo no se movió.
+-- Aunque el objetivo esté quieto, el torso del jugador se mueve por
+-- el movimiento del ratón: no hace falta reescribir cada frame.
+Mod.IDLE_SKIP = 2
+
+-- ═══════════════════════════════════════════════════════════════════
+-- estado
+-- ═══════════════════════════════════════════════════════════════════
+local lastWrite = nil      -- último CFrame escrito
+local idleFrames = 0
+local lastTargetPart = nil
+
+-- ═══════════════════════════════════════════════════════════════════
+-- limitar el giro por frame
+-- ═══════════════════════════════════════════════════════════════════
+-- Devuelve el CFrame deseado pero limitado a MAX_TURN grados de
+-- diferencia respecto al actual.
+function Mod.limitTurn(current, desired)
+	local maxRad = math.rad(Mod.MAX_TURN)
+
+	-- ángulo entre la mirada actual y la deseada
+	local dot = Core.clamp(current.LookVector:Dot(desired.LookVector), -1, 1)
+	local ang = math.acos(dot)
+	if ang <= maxRad then return desired end
+	if ang < 1e-6 then return desired end
+
+	-- eje de rotación
+	local axis = current.LookVector:Cross(desired.LookVector)
+	if axis.Magnitude < 1e-6 then
+		-- Caso antiparalelo (el objetivo está exactamente detrás):
+		-- el producto vectorial es nulo, así que se elige cualquier eje
+		-- perpendicular a la mirada actual.
+		local v = current.LookVector
+		if math.abs(v.X) < 0.9 then
+			axis = v:Cross(Vector3.new(1, 0, 0))
+		else
+			axis = v:Cross(Vector3.new(0, 1, 0))
+		end
+		if axis.Magnitude < 1e-6 then return desired end
+	end
+	axis = axis.Unit
+
+	-- fórmula de Rodrigues: rota current.LookVector maxRad alrededor
+	-- del eje, en el sentido del objetivo
+	local k = axis
+	local v = current.LookVector
+	local c, s = math.cos(maxRad), math.sin(maxRad)
+	local kv = Vec.new(
+		k.Y * v.Z - k.Z * v.Y,
+		k.Z * v.X - k.X * v.Z,
+		k.X * v.Y - k.Y * v.X
+	)
+	local kd = k.X * v.X + k.Y * v.Y + k.Z * v.Z
+	local look = Vec.new(
+		v.X * c + kv.X * s + k.X * kd * (1 - c),
+		v.Y * c + kv.Y * s + k.Y * kd * (1 - c),
+		v.Z * c + kv.Z * s + k.Z * kd * (1 - c)
+	).Unit
+
+	return CFrame.lookAt(current.Position, current.Position + look)
+end
+
+-- ═══════════════════════════════════════════════════════════════════
+-- ¿hace falta escribir?
+-- ═══════════════════════════════════════════════════════════════════
+-- Devuelve true si la cámara se ha movido lo suficiente como para
+-- justifies una escritura. Evita tráfico de replicación inútil.
+function Mod.shouldWrite(current, desired, target)
+	-- el objetivo cambió: hay que escribir sí o sí
+	if target ~= lastTargetPart then
+		lastTargetPart = target
+		idleFrames = 0
+		return true
+	end
+
+	-- el objetivo es el mismo: compara la orientación
+	if not lastWrite then return true end
+	local moved = (desired.LookVector - current.LookVector).Magnitude
+	if moved > 0.0015 then
+		idleFrames = 0
+		return true
+	end
+
+	-- lleva varios frames sin escribir: escribe uno de vez en cuando
+	-- para no perder el control del FOV / del ancla
+	idleFrames += 1
+	if idleFrames >= Mod.IDLE_SKIP then
+		idleFrames = 0
+		return true
+	end
+	return false
+end
+
+function Mod.markWritten(cf)
+	lastWrite = cf
+end
+
+-- ═══════════════════════════════════════════════════════════════════
+-- instalación
+-- ═══════════════════════════════════════════════════════════════════
+function Mod.install(api)
+	api = api or Core.api()
+	api._trace = Mod
+	Core.trace = Mod
+	return Mod
+end
+
+-- se engancha al core en tiempo de carga para que la cámara lo vea
+Core.trace = Mod
+
+return Mod
 end)()
 
 local Camera = (function()
@@ -2135,8 +2510,26 @@ local Camera = (function()
 	· cam      → ancla la cámara a camAnchor y aplica camFov + camSmooth
 	· fov      → radio (en grados) del círculo de captura de objetivos
 
+	NOTAS DE RASTRO:
+	· La cámara sólo se escribe cuando el objetivo cambia o cuando
+	  todavía está "en camino". Escribir CFrame a 60 Hz de forma
+	  constante es lo más fácil de detectar: el servidor ve el
+	  HumanoidRootPoint girando a velocidad imposible para un ratón.
+	· 'speed' y 'camSmooth' controlan ese salto: valores bajos hacen
+	  que el giro sea gradual (menos señal) pero menos preciso.
+	· Se respeta un ángulo máximo de giro por frame. Si el objetivo
+	  está detrás, la cámara " Barre " en vez de teletransportarse.
+	· El FOV real de la cámara se guarda una vez (Core.originalFov) y
+	  se restaura al apagar 'cam', para no dejar el FOV del jugador
+	  alterado al cerrar el script.
+
 	Requiere core.lua cargado antes.
 ]]
+
+-- El módulo de rastro es opcional: si está cargado (Core.trace),
+-- limita el giro por frame y evita escrituras inútiles de CFrame.
+-- Se resuelve en tiempo de llamada para que funcione tanto en el
+-- archivo único como en multi-archivo.
 
 local UserInputService = Core.UserInputService
 local Workspace        = Core.Workspace
@@ -2148,6 +2541,10 @@ Mod.__name = "Camera"
 Mod.target    = nil      -- { player, part, distance }
 Mod.lastAim   = false
 Mod.lastCam   = false
+
+-- Objetivo al que se está girando ahora (para no reescribir el
+-- CFrame si no ha cambiado).
+local lastTarget = nil
 
 -- ═══════════════════════════════════════════════════════════════════
 -- búsqueda del objetivo
@@ -2171,11 +2568,11 @@ function Mod.findTarget(cfg, cam, bone)
 					if ang <= radius and dist < bestDist then
 						bestDist = dist
 						best = {
-							player   = plr,
+							player    = plr,
 							character = char,
-							part     = part,
+							part      = part,
 							distance  = dist,
-							angle    = ang,
+							angle     = ang,
 						}
 					end
 				end
@@ -2227,6 +2624,7 @@ function Mod.update(dt)
 
 	if not aimOn and not camOn then
 		Mod.target = nil
+		lastTarget = nil
 		return
 	end
 
@@ -2269,6 +2667,18 @@ function Mod.update(dt)
 	-- ── aplicar ──────────────────────────────────────────────────────
 	local desired = CFrame.lookAt(wantPos, lookAt)
 
+	-- el módulo de rastro (si está cargado) limita el salto por frame
+	-- y evita escrituras de CFrame que no cambian nada
+	local Trace = Core.trace
+	if Trace then
+		desired = Trace.limitTurn(cam.CFrame, desired)
+	end
+
+	local targetPart = target and target.part or nil
+	if Trace and not Trace.shouldWrite(cam.CFrame, desired, targetPart) then
+		return
+	end
+
 	if camOn then
 		local alpha = Core.smoothAlpha(cfg.camSmooth, dt)
 		cam.CFrame = cam.CFrame:Lerp(desired, alpha)
@@ -2276,11 +2686,18 @@ function Mod.update(dt)
 		local alpha = Core.smoothAlpha(cfg.speed, dt)
 		cam.CFrame = cam.CFrame:Lerp(desired, alpha)
 	end
+
+	if Trace then
+		Trace.markWritten(cam.CFrame)
+	end
+
+	lastTarget = target
 end
 
-if type(getgenv) == "function" then
-	getgenv().DuelosCamera = Mod
-end
+-- ═══════════════════════════════════════════════════════════════════
+-- publicación (tabla compartida Duelos)
+-- ═══════════════════════════════════════════════════════════════════
+Core.api()._camera = Mod
 
 return Mod
 end)()
@@ -2300,6 +2717,15 @@ local Hitbox = (function()
 	El Size original se guarda una sola vez por parte (en `originals`)
 	para poder restaurarlo aunque el jugador reaparezca o el script
 	lleve un rato corriendo.
+
+	NOTAS DE RASTRO:
+	· El Size se escribe UNA vez por cambio de escala, no en cada
+	  frame. Escribir Size a 60 Hz genera una cola de replicación
+	  constante que el servidor ve como tráfico anómalo.
+	· La parte original se guarda con su Size exacto: al revertir se
+	  devuelve ese valor, no un tamaño "parecido".
+	· Al salir un jugador se restaura su tamaño inmediatamente, para
+	  no dejar un jugador con hitbox deforme si el script se recarga.
 
 	Requiere core.lua cargado antes.
 ]]
@@ -2419,9 +2845,10 @@ do
 	end)
 end
 
-if type(getgenv) == "function" then
-	getgenv().DuelosHitbox = Mod
-end
+-- ═══════════════════════════════════════════════════════════════════
+-- publicación (tabla compartida Duelos)
+-- ═══════════════════════════════════════════════════════════════════
+Core.api()._hitbox = Mod
 
 return Mod
 end)()
@@ -2434,7 +2861,6 @@ local ESP = (function()
 	Crea y administra objetos Highlight sobre los personajes de los
 	demás jugadores.
 
-	· esp      → activa/desactiva el resaltado
 	· espWall  → true  = AlwaysOnTop (se ve a través de las paredes)
 	             false = Occluded (sólo donde hay línea de visión)
 	· espStyle → "box" (Highlight + contorno de caja)
@@ -2443,20 +2869,60 @@ local ESP = (function()
 	· espRange → distancia máxima en studs
 	· espAlpha → opacidad (0.8 o 80)
 
+	NOTAS DE RASTREO (por qué este módulo es discreto):
+	· Los Highlight se cuelgan de un contenedor local dentro de
+	  workspace, NO del modelo del rival. Meterlos dentro del otro
+	  jugador es una señal evidente para cualquier revisión del juego.
+	· El contenedor se destruye entero al apagar el ESP, así que no
+	  quedan objetos huérfanos en la partida.
+	· Los objetos se crean una sola vez por jugador y se reutilizan:
+	  no se instancia/destruye en cada frame.
+	· La actualización va a baja frecuencia (ESP_TICK), no a 60 Hz.
+
 	Requiere core.lua cargado antes.
 ]]
 
 local Players = Core.Players
+local Workspace = Core.Workspace
 
 local Mod = {}
 Mod.__name = "ESP"
 
--- por jugador: { highlight, box, billboard, root }
+-- por jugador: { highlight, box, billboard, root, head }
 Mod.objects = {}
 
-local COL_FILL    = Color3.fromRGB(255, 70, 70)
-local COL_OUTLINE = Color3.fromRGB(255, 255, 255)
-local COL_TEXT    = Color3.fromRGB(255, 255, 255)
+-- contenedor local: los adornos cuelgan de aquí, no del rival
+local container = nil
+
+-- frecuencia de actualización (segundos). 0.08 ≈ 12 Hz: suficiente
+-- para que el ESP se vea fluido sin churning de instancias.
+local ESP_TICK = 0.08
+
+-- ═══════════════════════════════════════════════════════════════════
+-- contenedor
+-- ═══════════════════════════════════════════════════════════════════
+local function getContainer()
+	if container and container.Parent then
+		return container
+	end
+	local ok, c = pcall(function()
+		local f = Instance.new("Folder")
+		f.Name = "DuelosESP"
+		f.Parent = Workspace
+		return f
+	end)
+	container = ok and c or nil
+	return container
+end
+
+local function destroyContainer()
+	if container and container.Parent then
+		pcall(function()
+			container:Destroy()
+		end)
+	end
+	container = nil
+end
 
 -- ═══════════════════════════════════════════════════════════════════
 -- profundidad (a través de paredes)
@@ -2476,35 +2942,42 @@ end
 -- ═══════════════════════════════════════════════════════════════════
 -- construcción de los objetos
 -- ═══════════════════════════════════════════════════════════════════
+local COL_FILL    = Color3.fromRGB(255, 70, 70)
+local COL_OUTLINE = Color3.fromRGB(255, 255, 255)
+local COL_TEXT    = Color3.fromRGB(255, 255, 255)
+
 local function makeHighlight(char, alpha)
-	local hl = Instance.new("Highlight")
-	hl.Name = "DuelosESP"
-	hl.Adornee = char
-	hl.FillColor = COL_FILL
-	hl.OutlineColor = COL_OUTLINE
-	hl.FillTransparency = 1 - alpha
-	hl.OutlineTransparency = 1 - (alpha * 0.8)
-	hl.Enabled = true
-	hl.Parent = char
-	return hl
+	local ok, hl = pcall(function()
+		local h = Instance.new("Highlight")
+		h.Name = "DuelosESP"
+		h.Adornee = char          -- adorna al rival, pero NO vive en su modelo
+		h.FillColor = COL_FILL
+		h.OutlineColor = COL_OUTLINE
+		h.FillTransparency = 1 - alpha
+		h.OutlineTransparency = 1 - (alpha * 0.8)
+		h.Enabled = true
+		h.Parent = getContainer()
+		return h
+	end)
+	return ok and hl or nil
 end
 
 local function makeBox(char, alpha)
 	local ok, box = pcall(function()
 		local b = Instance.new("BoxHandleAdornment")
-		b.Name = "DuelosBox"
+		b.Name = "DuelosESPBox"
 		b.Adornee = char
 		b.AlwaysOnTop = false
 		b.Transparency = 1 - alpha
 		b.Color = COL_OUTLINE
 		b.Size = char:GetExtentsSize()
-		b.Parent = char
+		b.Parent = getContainer()
 		return b
 	end)
 	return ok and box or nil
 end
 
-local function makeBillboard(char, head, style, alpha)
+local function makeBillboard(head, style, alpha)
 	local ok, gui = pcall(function()
 		local bg = Instance.new("BillboardGui")
 		bg.Name = "DuelosESPText"
@@ -2513,7 +2986,7 @@ local function makeBillboard(char, head, style, alpha)
 		bg.Size = UDim2.fromOffset(120, 24)
 		bg.StudsOffsetWorldSpace = Vector3.new(0, 2.2, 0)
 		bg.MaxDistance = 1000
-		bg.Parent = head
+		bg.Parent = getContainer()
 
 		if style == "dot" then
 			local dot = Instance.new("Frame")
@@ -2548,10 +3021,14 @@ end
 -- ═══════════════════════════════════════════════════════════════════
 -- crear / destruir
 -- ═══════════════════════════════════════════════════════════════════
+-- IMPORTANTE: sólo se destruyen los objetos que creó este módulo
+-- (highlight / box / billboard). `root` y `head` son partes del OTRO
+-- jugador: destruirlas las borraría de la partida (y del servidor).
 function Mod.destroyFor(plr)
 	local o = Mod.objects[plr]
 	if not o then return end
-	for _, obj in pairs(o) do
+	for _, key in ipairs({ "highlight", "box", "billboard" }) do
+		local obj = o[key]
 		if obj and obj.Parent then
 			pcall(function()
 				obj:Destroy()
@@ -2566,10 +3043,11 @@ function Mod.destroyAll()
 		Mod.destroyFor(plr)
 	end
 	Mod.objects = {}
+	destroyContainer()
 end
 
 -- ═══════════════════════════════════════════════════════════════════
--- loop principal (llamar cada frame o cada ~0.1 s)
+-- loop principal
 -- ═══════════════════════════════════════════════════════════════════
 function Mod.update()
 	local cfg = Core.getConfig()
@@ -2580,13 +3058,19 @@ function Mod.update()
 	local wall = cfg.espWall ~= false
 
 	if not enabled then
-		Mod.destroyAll()
+		-- el contenedor se destruye entero: no quedan restos
+		if next(Mod.objects) or container then
+			Mod.destroyAll()
+		end
 		return
 	end
 
-	-- limpia los que ya no sirven
+	local parent = getContainer()
+	if not parent then return end
+
+	-- limpia los que ya no sirven (jugador se fue)
 	for plr in pairs(Mod.objects) do
-		if not Players:FindFirstChild(plr.Name) then
+		if plr.Parent ~= Players then
 			Mod.destroyFor(plr)
 		end
 	end
@@ -2616,7 +3100,7 @@ function Mod.update()
 			o = {
 				highlight = makeHighlight(char, alpha),
 				box      = (style == "box") and makeBox(char, alpha) or nil,
-				billboard = (style ~= "box") and makeBillboard(char, head, style, alpha) or nil,
+				billboard = (style ~= "box") and makeBillboard(head, style, alpha) or nil,
 				root     = root,
 				head     = head,
 			}
@@ -2654,9 +3138,10 @@ Players.PlayerRemoving:Connect(function(plr)
 	Mod.destroyFor(plr)
 end)
 
-if type(getgenv) == "function" then
-	getgenv().DuelosESP = Mod
-end
+-- ═══════════════════════════════════════════════════════════════════
+-- publicación (tabla compartida Duelos)
+-- ═══════════════════════════════════════════════════════════════════
+Core.api()._esp = Mod
 
 return Mod
 end)()
@@ -2673,11 +3158,20 @@ local Count = (function()
 		· inGame     → tienen personaje spawneado (vivos o muertos)
 		· enEspera   → sin personaje todavía
 		· otros      → todo lo que no sea el LocalPlayer
+		· enemigos   → en partida y de otro equipo
+		· equipo     → en partida y del mismo equipo
 
 	Publica el resultado en:
-		· getgenv().DuelosCount   → tabla con los datos
-		· Hooks.onCount(state)    → callback para la interfaz
-		· una etiqueta de texto opcional (CountLabel) en la UI
+		· getgenv().Duelos._count  → módulo con el estado
+		· Hooks.onCount(state)     → callback para la interfaz
+		· las etiquetas "enemigos" / "compañeros" del inicio
+
+	NOTAS DE RASTRO:
+	· El refresco es a 1 Hz, no por frame. El contador no necesita más.
+	· Los eventos PlayerAdded / PlayerRemoving disparan un refresco
+	  inmediato, así que el número es correcto sin polling constante.
+	· Los errores se silencian: un fallo en un evento no debe imprimir
+	  ruido en la consola del executor.
 
 	Requiere core.lua cargado antes.
 ]]
@@ -2824,21 +3318,23 @@ end
 -- ═══════════════════════════════════════════════════════════════════
 Players.PlayerAdded:Connect(function()
 	task.defer(function()
-		Mod.update()
+		pcall(Mod.update)
 	end)
 end)
 
 Players.PlayerRemoving:Connect(function()
 	task.defer(function()
-		Mod.update()
+		pcall(Mod.update)
 	end)
 end)
 
-Players.LocalPlayer.CharacterAdded:Connect(function()
-	task.defer(function()
-		Mod.update()
+if Core.LocalPlayer and Core.LocalPlayer.CharacterAdded then
+	Core.LocalPlayer.CharacterAdded:Connect(function()
+		task.defer(function()
+			pcall(Mod.update)
+		end)
 	end)
-end)
+end
 
 -- refresco cada segundo por si un personaje aparece/desaparece sin evento
 task.spawn(function()
@@ -2850,12 +3346,13 @@ end)
 
 -- primera lectura
 task.defer(function()
-	Mod.update()
+	pcall(Mod.update)
 end)
 
-if type(getgenv) == "function" then
-	getgenv().DuelosCount = Mod
-end
+-- ═══════════════════════════════════════════════════════════════════
+-- publicación (tabla compartida Duelos)
+-- ═══════════════════════════════════════════════════════════════════
+Core.api()._count = Mod
 
 return Mod
 end)()
@@ -2869,8 +3366,8 @@ local Main = (function()
 	(multi-archivo) o el generador build_single.js (archivo único).
 
 	Da por hecho que en el ámbito actual existen:
-		Core, Camera, Hitbox, ESP, Count
-	(y que la interfaz ya.publicó getgenv().Duelos con su Config).
+		Core, Camera, Hitbox, ESP, Count, Hardening
+	(y que la interfaz ya publicó getgenv().Duelos con su Config).
 ]]
 
 local RunService = game:GetService("RunService")
@@ -2879,81 +3376,102 @@ local RunService = game:GetService("RunService")
 -- enganche con los hooks de la interfaz
 -- ═══════════════════════════════════════════════════════════════════
 local g = (type(getgenv) == "function") and getgenv() or nil
-local API = g and g.Duelos
+local api = (g and g.Duelos) or {}
+local API = api
 
-if API and type(API.Hooks) == "table" then
-	-- aim: al apagar se restaura el FOV si la cámara también está apagada
-	API.Hooks.onAim = function(state)
-		if not state then
-			local cam = Core.getCamera()
-			if cam and Core.originalFov and not Core.getConfig().cam then
-				cam.FieldOfView = Core.originalFov
-				Core.originalFov = nil
-			end
+if type(API.Hooks) ~= "table" then
+	API.Hooks = {}
+end
+
+-- instala el hardening y el control de rastro
+local Hardening = api._hardening
+local Trace = api._trace
+if Hardening and type(Hardening.install) == "function" then
+	Hardening.install(api)
+end
+if Trace and type(Trace.install) == "function" then
+	Trace.install(api)
+end
+
+-- aim: al apagar se restaura el FOV si la cámara también está apagada
+API.Hooks.onAim = function(state)
+	if not state then
+		local cam = Core.getCamera()
+		if cam and Core.originalFov and not Core.getConfig().cam then
+			cam.FieldOfView = Core.originalFov
+			Core.originalFov = nil
 		end
 	end
+end
 
-	-- hitbox: al apagar se revierte (si hbRevert está activo)
-	API.Hooks.onHitbox = function(state, key)
-		if not state and key == "hb" then
-			if Core.getConfig().hbRevert then
-				Hitbox.revertAll()
-			end
+-- hitbox: al apagar se revierte (si hbRevert está activo)
+API.Hooks.onHitbox = function(state, key)
+	if not state and key == "hb" then
+		if Core.getConfig().hbRevert then
+			Hitbox.revertAll()
 		end
 	end
+end
 
-	-- esp: al apagar se destruyen los highlights
-	API.Hooks.onEsp = function(state, key)
-		if not state and key == "esp" then
-			ESP.destroyAll()
+-- esp: al apagar se destruyen los highlights
+API.Hooks.onEsp = function(state, key)
+	if not state and key == "esp" then
+		ESP.destroyAll()
+	end
+end
+
+-- cam: al apagar se restaura el FOV original
+API.Hooks.onCam = function(state, key)
+	if not state and key == "cam" then
+		local cam = Core.getCamera()
+		if cam and Core.originalFov then
+			cam.FieldOfView = Core.originalFov
+			Core.originalFov = nil
 		end
 	end
+end
 
-	-- cam: al apagar se restaura el FOV original
-	API.Hooks.onCam = function(state, key)
-		if not state and key == "cam" then
-			local cam = Core.getCamera()
-			if cam and Core.originalFov then
-				cam.FieldOfView = Core.originalFov
-				Core.originalFov = nil
-			end
-		end
-	end
-
-	-- contador de jugadores
-	API.Hooks.onCount = function(state, text)
-		-- aquí puedes pintar el texto en cualquier otro sitio de tu interfaz
-	end
+-- contador de jugadores
+API.Hooks.onCount = function(state, text)
+	-- aquí puedes pintar el texto en cualquier otro sitio de tu interfaz
 end
 
 -- ═══════════════════════════════════════════════════════════════════
 -- bucle principal
 -- ═══════════════════════════════════════════════════════════════════
+-- Todo el trabajo va envuelto en guard(): si un módulo falla, el
+-- error se cuenta pero no llena la consola del executor.
 RunService:BindToRenderStep("Duelos_Camera", Enum.RenderPriority.Camera.Value - 1, function(dt)
-	pcall(Camera.update, dt)
+	Hardening.guard(Camera.update, dt)
 end)
 
 RunService:BindToRenderStep("Duelos_ESP", Enum.RenderPriority.Character.Value, function()
-	pcall(ESP.update)
+	Hardening.guard(ESP.update)
 end)
 
 RunService.Heartbeat:Connect(function()
-	pcall(Hitbox.update)
+	Hardening.guard(Hitbox.update)
 end)
 
 -- ═══════════════════════════════════════════════════════════════════
 -- API pública
 -- ═══════════════════════════════════════════════════════════════════
 local Main = {
-	Core   = Core,
-	Camera = Camera,
-	Hitbox = Hitbox,
-	ESP    = ESP,
-	Count  = Count,
+	Core      = Core,
+	Camera    = Camera,
+	Hitbox    = Hitbox,
+	ESP       = ESP,
+	Count     = Count,
+	Hardening = Hardening,
 
 	-- contador listo para consultar (refresca y devuelve el estado actual)
 	getCount = function()
 		return Count.update()
+	end,
+
+	-- errores silenciados (sube si algo falla)
+	getErrors = function()
+		return Core.errors
 	end,
 
 	-- parar todo y limpiar
@@ -2962,6 +3480,7 @@ local Main = {
 		RunService:UnbindFromRenderStep("Duelos_ESP")
 		Hitbox.revertAll()
 		ESP.destroyAll()
+		Core.runCleanups()
 		local cam = Core.getCamera()
 		if cam and Core.originalFov then
 			cam.FieldOfView = Core.originalFov
@@ -2971,7 +3490,15 @@ local Main = {
 }
 
 if type(getgenv) == "function" then
-	getgenv().DuelosMain = Main
+	-- un único global: todo bajo Duelos
+	local t = (g.Duelos or {})
+	t.Main = Main
+	t._core = Core
+	t._camera = Camera
+	t._hitbox = Hitbox
+	t._esp = ESP
+	t._count = Count
+	g.Duelos = t
 end
 
 return Main
@@ -2980,14 +3507,16 @@ end)()
 -- ═════════ construcción / publicación ═════════
 local _g = (type(getgenv) == "function") and getgenv() or nil
 
+-- el hardening se instala con la API compartida
+Hardening.install(_g and _g.Duelos or nil)
+Trace.install(_g and _g.Duelos or nil)
+
 if _g then
-	_g.DuelosUI = UI
-	_g.DuelosCore = Core
-	_g.DuelosCamera = Camera
-	_g.DuelosHitbox = Hitbox
-	_g.DuelosESP = ESP
-	_g.DuelosCount = Count
-	_g.DuelosMain = Main
+	-- un ÚNICO global: todo cuelga de Duelos
+	local _t = _g.Duelos or {}
+	_t.UI = UI
+	_t.Main = Main
+	_g.Duelos = _t
 end
 
 return Main
