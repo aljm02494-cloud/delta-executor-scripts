@@ -1196,8 +1196,8 @@ do
 	-- detección en partida
 	y = caption(home, y, "detectado en la partida")
 	local l2 = makeList(home, y, ROW_H * 2)
-	makeRow(l2, 0, {k = "enemigos", v = "—"})
-	makeRow(l2, 1, {k = "compañeros", v = "—"})
+	makeRow(l2, 0, {k = "enemigos", v = "—", valueId = "enemigos"})
+	makeRow(l2, 1, {k = "compañeros", v = "—", valueId = "companeros"})
 	y = y + ROW_H * 2
 
 	heights.home = y + 16
@@ -1810,6 +1810,12 @@ local API = {
 	toast  = toast,
 	setSwitch = setSwitch,
 	refreshHomeLabels = refreshHomeLabels,
+
+	-- etiquetas del contador de jugadores (las rellena mod_playercount)
+	CountLabels = {
+		enemigos   = ValueLabels["enemigos"],
+		companeros = ValueLabels["companeros"],
+	},
 
 	-- abrir / cerrar desde tu código (teclas, botones, etc.)
 	open  = openUI,
